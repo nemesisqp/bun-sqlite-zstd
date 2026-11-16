@@ -1,0 +1,25 @@
+# Node / npm
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.tgz
+.npm
+
+# Rust
+/target
+*.node
+
+# Generated platform packages (created by scripts/create-npm-dirs.mjs at release time)
+/npm
+
+# Local dev
+bun.lockb
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs
+logs
+*.log
