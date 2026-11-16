@@ -55,10 +55,18 @@ jobs:
           - host: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             artifact: libsqlite_zstd.so
+            # musl targets default to crt-static, which disables cdylib
+            # builds ("target does not support these crate types").
+            # -crt-static re-enables dynamic linking so the .so can be
+            # built; it then links against the musl libc at runtime,
+            # which is exactly what the musl platform package is for.
+            # (Same flag napi-rs adds for musl targets.)
+            rustflags: -C target-feature=-crt-static
             build: cargo zigbuild --release --features build_extension --target x86_64-unknown-linux-musl
           - host: ubuntu-22.04
             target: aarch64-unknown-linux-musl
             artifact: libsqlite_zstd.so
+            rustflags: -C target-feature=-crt-static
             build: cargo zigbuild --release --features build_extension --target aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v5
@@ -109,9 +117,11 @@ jobs:
       - run: npm ci
       # No RUSTFLAGS target-cpu here, ever: prebuilts must run on any CPU of
       # the arch. zstd dispatches SIMD at runtime.
+      # musl jobs set RUSTFLAGS=-C target-feature=-crt-static via the
+      # matrix (see above); every other job builds with empty RUSTFLAGS.
       - run: ${{ matrix.settings.build }}
         env:
-          RUSTFLAGS: ''
+          RUSTFLAGS: ${{ matrix.settings.rustflags }}
       - uses: actions/upload-artifact@v6
         with:
           name: ext-${{ matrix.settings.target }}

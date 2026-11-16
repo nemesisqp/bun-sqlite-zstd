@@ -8,6 +8,20 @@ import { openDatabase } from "../index.js";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Db = any;
 
+// Windows releases SQLite file locks asynchronously after close(), so a
+// plain rmSync in `finally` flakes with EBUSY there. Retry briefly.
+function removeDir(dir: string) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err: any) {
+      if (attempt === 9 || (err?.code !== "EBUSY" && err?.code !== "EPERM")) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+}
+
 const rowJson = (i: number) =>
   JSON.stringify({
     i,
@@ -87,7 +101,7 @@ describe("transparent compression", () => {
       } catch {
         // already closed above
       }
-      rmSync(dir, { recursive: true, force: true });
+      removeDir(dir);
     }
   });
 
@@ -114,7 +128,7 @@ describe("transparent compression", () => {
       } catch {
         // ignore
       }
-      rmSync(dir, { recursive: true, force: true });
+      removeDir(dir);
     }
   });
 });
