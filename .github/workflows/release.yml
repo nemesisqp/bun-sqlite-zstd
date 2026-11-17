@@ -150,7 +150,15 @@ jobs:
           node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
-      - run: npm ci
+      # `npm ci` cannot be used here: npm 11 (Node 24) requires the
+      # lockfile to contain an entry for every optionalDependency, but
+      # the platform packages for the version being released do not
+      # exist on npm until this job publishes them, so no lockfile can
+      # list them yet (`npm ci` fails with EUSAGE "Missing: ... from
+      # lock file"). `npm install` skips unresolvable optional
+      # dependencies and installs the rest (typescript), which is all
+      # this job needs.
+      - run: npm install --ignore-scripts --no-audit --no-fund
       - uses: actions/download-artifact@v7
         with:
           pattern: ext-*
