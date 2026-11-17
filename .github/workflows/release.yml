@@ -3,14 +3,17 @@ name: Release
 # Builds the prebuilt sqlite-zstd extension for every supported platform
 # and publishes the main package + all platform packages to npm.
 #
-# Triggered by pushing a semver tag (v0.1.0, v0.2.0, ...). Requires the
-# NPM_TOKEN repository secret: a npm *granular* access token with publish
-# access to this package and "Bypass 2FA" enabled (classic/automation
-# tokens were revoked by npm on 2025-12-09 and no longer exist).
-# NOTE: npm is removing direct publishing with granular tokens in
-# January 2027 — after that this workflow needs trusted publishing
-# (OIDC) or a stage-only token + manual 2FA approval. For a one-off
-# publish before then, the granular token above is enough.
+# Triggered by pushing a semver tag (v0.1.0, v0.2.0, ...). Publishes via
+# npm trusted publishing (OIDC): the publish job requests an OIDC token
+# (permissions: id-token: write) and the npm CLI exchanges it for a
+# short-lived publish token — no NPM_TOKEN secret is used or needed.
+# Each package (main + 7 platform packages) needs a GitHub Actions
+# trusted publisher configured on npmjs.com for this repo + workflow
+# file release.yml, with direct `npm publish` allowed. A new trusted
+# publisher config must complete its first successful publish within
+# 2 days or it expires. npm removed classic/automation tokens on
+# 2025-12-09 and is removing direct publishing with granular tokens
+# in January 2027.
 #
 # Deliberately NO source-build fallback anywhere: if a platform has no
 # prebuilt here, `npm install`/`bun install` must fail (see
@@ -134,11 +137,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Required for npm trusted publishing (OIDC): lets this job request
+      # the OIDC token the npm CLI exchanges for a short-lived publish
+      # token. No NPM_TOKEN secret is used.
+      id-token: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          # Node 24 bundles npm 11; trusted publishing needs npm CLI
+          # 11.5.1 or later (Node 22 still ships npm 10).
+          node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
@@ -153,12 +162,8 @@ jobs:
           for f in npm/*/package.json; do echo "--- $f"; cat "$f"; done
       - name: Publish main package
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish platform packages
         run: |
           for dir in npm/*/; do
             (cd "$dir" && npm publish --access public)
           done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
