@@ -19,7 +19,8 @@ An optimization audit (Nov 2026, full notes in the investigation that
 preceded this repo) concluded there is **no noteworthy general
 optimization** in sqlite-zstd: the hot code is already Rust calling the
 zstd C library at near-C speed. This fork therefore changes nothing
-about the compression core except the two items below.
+about the compression core except the items below (the WITHOUT ROWID
+fix in 0.1.2 is a bug fix in the maintenance SQL, not an optimization).
 
 ## Changes vs upstream 0.3.5
 
@@ -55,6 +56,31 @@ id. Output is byte-identical to the by-id path (Rust test
 `blob_dict_matches_id_dict` in `src/add_functions.rs` + JS tests in
 `test/basic.test.ts`).
 
+### WITHOUT ROWID maintenance fix (`src/transparent.rs`, 0.1.2)
+
+Upstream's incremental maintenance compressed each chunk with
+`... where rowid in (select rowid from _tbl_zstd where ...)`. WITHOUT
+ROWID tables have no `rowid` pseudo-column, so maintenance failed with
+`no such column: rowid` — but only once a group passed the ~500 kB
+dict-training threshold, so small tables looked fine. Enable, the view,
+the triggers, dict training and VACUUM all already worked on WITHOUT
+ROWID; only this one statement assumed a rowid.
+
+The fix chunks by primary key instead: `where (pk1, pk2, ...) in
+(select pk1, pk2, ... where ... limit :chunksize)` (row-value `IN`,
+SQLite ≥ 3.15; the extension already requires ≥ 3.49.1). PK columns are
+re-derived at maintenance time with
+`select name from pragma_table_info(?) where pk > 0 order by pk` on the
+shadow table — the stored config carries no PK info, and re-deriving
+keeps already-enabled databases working. A PK is guaranteed (enable
+bails without one) and the compressed column can never be part of it.
+On rowid tables this is a PK-index seek per chunk row instead of a
+rowid seek (measured: no change in shrink or maintenance time at 20k
+rows); on WITHOUT ROWID tables the table *is* the PK B-tree. Covered by
+Rust tests `without_rowid_transparent` (TEXT PK) and
+`without_rowid_composite_pk`, plus a JS test in
+`test/transparent.test.ts`.
+
 ### Clippy cleanups (no behaviour change)
 
 So `cargo clippy --all-targets -- -D warnings` passes:
@@ -74,8 +100,10 @@ So `cargo clippy --all-targets -- -D warnings` passes:
 
 ## Not changed
 
-- The compression core, transparent-compression logic, dict training,
-  and the SQLite function surface are upstream code, unchanged.
+- The compression core, dict training, and the SQLite function surface
+  are upstream code, unchanged. Transparent-compression logic is
+  unchanged except the maintenance chunk UPDATE (WITHOUT ROWID fix
+  above) — enable, view, triggers and dict training are untouched.
 - Upstream behaviours kept as-is: groups under ~500 kB total stay
   uncompressed by design; `zstd_train_dict` sampling is random.
 - License: the Rust crate stays `LGPL-2.0-or-later` per upstream's

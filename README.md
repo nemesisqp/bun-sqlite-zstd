@@ -145,6 +145,11 @@ Bundles phiresky/sqlite-zstd **0.3.5**, with these changes (see
 - **Corrupt input now errors** instead of silently decoding to an
   empty string (new zstd behaviour: `Unknown frame descriptor`).
   Empty input and a bare magic still decode to `""`.
+- **WITHOUT ROWID tables work** (0.1.2): upstream maintenance chunked
+  by `rowid`, which does not exist on WITHOUT ROWID tables, so
+  `zstd_incremental_maintenance()` failed with `no such column: rowid`
+  once a group passed the dict-training threshold. Maintenance now
+  chunks by primary key instead. No change for rowid tables.
 - Minor clippy cleanups (deprecated chrono calls, redundant `&` in
   format args, a debug `println!` in a test) so `cargo clippy
   -- -D warnings` passes.

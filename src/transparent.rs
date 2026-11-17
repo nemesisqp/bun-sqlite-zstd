@@ -699,6 +699,11 @@ struct EscapedNames {
     compressed_tablename: String,
     data_colname: String,
     dict_colname: String,
+    /// Primary-key columns of the shadow table, in PK order, already
+    /// escaped. Filled in by `maintenance_for_config` (the stored config
+    /// carries no PK info). Used to chunk the compression UPDATE without
+    /// `rowid`, so maintenance also works on WITHOUT ROWID tables.
+    pk_columns: Vec<String>,
 }
 impl From<&TransparentCompressConfig> for EscapedNames {
     fn from(config: &TransparentCompressConfig) -> EscapedNames {
@@ -706,8 +711,33 @@ impl From<&TransparentCompressConfig> for EscapedNames {
             compressed_tablename: escape_sqlite_identifier(&format!("_{}_zstd", config.table)),
             data_colname: escape_sqlite_identifier(&config.column),
             dict_colname: escape_sqlite_identifier(&format!("_{}_dict", config.column)),
+            pk_columns: Vec::new(),
         }
     }
+}
+
+/// Primary-key columns of a shadow table (`_{table}_zstd`), in PK
+/// declaration order, already escaped.
+///
+/// Re-derived at maintenance time instead of stored in the config: the
+/// config JSON predates this and already-enabled databases must keep
+/// working. `PRAGMA table_info` reports `pk > 0` for WITHOUT ROWID tables
+/// too (query the shadow table, not the view — table_info on a view
+/// reports pk = 0 for every column).
+fn shadow_pk_columns(db: &Connection, shadow_table: &str) -> anyhow::Result<Vec<String>> {
+    let cols: Vec<String> = db
+        .prepare("select name from pragma_table_info(?) where pk > 0 order by pk")?
+        .query_map(params![shadow_table], |row| {
+            Ok(escape_sqlite_identifier(&row.get::<_, String>("name")?))
+        })?
+        .collect::<Result<_, _>>()
+        .context("Could not query shadow table primary key")?;
+    if cols.is_empty() {
+        anyhow::bail!(
+            "Table {shadow_table} has no primary key (was it changed after enabling compression?)"
+        );
+    }
+    Ok(cols)
 }
 
 fn maintenance_for_config(
@@ -715,7 +745,9 @@ fn maintenance_for_config(
     config: TransparentCompressConfig,
     args: &IncrementalMaintenanceArgs,
 ) -> anyhow::Result<MaintRet> {
-    let esc_names = EscapedNames::from(&config);
+    let mut esc_names = EscapedNames::from(&config);
+    esc_names.pk_columns =
+        shadow_pk_columns(db, &format!("_{}_zstd", config.table)).context("getting pk columns")?;
 
     let todos = db
         .prepare(&format!(
@@ -820,8 +852,21 @@ fn maintenance_for_todo(
     );
     loop {
         let update_start = Instant::now();
+        // Chunk by primary key, not by rowid: WITHOUT ROWID tables have no
+        // rowid pseudo-column, so the old `where rowid in (select rowid ...)`
+        // failed with "no such column: rowid" exactly when compression
+        // started working. A PK is guaranteed (enable bails without one),
+        // and a row-value IN works for single and composite keys alike.
+        // On rowid tables this is a PK-index seek per chunk row instead of
+        // a rowid seek; on WITHOUT ROWID tables the table IS the PK B-tree.
+        let pk_list = esc_names.pk_columns.join(", ");
+        let pk_row = if esc_names.pk_columns.len() == 1 {
+            pk_list.clone()
+        } else {
+            format!("({pk_list})")
+        };
         let q = &format!(
-            "update {tbl} set {datacol} = zstd_compress_col({datacol}, :lvl, :dict, :compact), {dictcol} = :dict where rowid in (select rowid from {tbl} where {dictcol} is null and :dictchoice = ({chooser}) limit :chunksize)",
+            "update {tbl} set {datacol} = zstd_compress_col({datacol}, :lvl, :dict, :compact), {dictcol} = :dict where {pk_row} in (select {pk_list} from {tbl} where {dictcol} is null and :dictchoice = ({chooser}) limit :chunksize)",
             tbl = esc_names.compressed_tablename,
             datacol = esc_names.data_colname,
             dictcol = esc_names.dict_colname,
@@ -1269,6 +1314,137 @@ mod tests {
             params![r#"{"table": "events", "column": "another_col", "compression_level": 3, "dict_chooser": "'1'"}"#],
             |_| Ok(())
         ).unwrap();
+    }
+
+    /// WITHOUT ROWID table with a TEXT primary key (the url-shortener
+    /// schema). Before the PK-chunked maintenance fix, the second query
+    /// below failed with `no such column: rowid` as soon as the group was
+    /// big enough to train a dictionary.
+    #[test]
+    fn without_rowid_transparent() -> anyhow::Result<()> {
+        let db = Connection::open_in_memory()?;
+        crate::add_functions::add_functions(&db).context("adding functions")?;
+        db.execute_batch(
+            "create table urls (
+                shortId text primary key,
+                url text not null,
+                createTime integer not null
+            ) without rowid;",
+        )?;
+        let payload = "x".repeat(500);
+        {
+            let mut ins =
+                db.prepare("insert into urls(shortId, url, createTime) values (?1, ?2, ?3)")?;
+            for i in 0..2000 {
+                ins.execute(params![
+                    format!("u{i:06}"),
+                    format!("https://example.com/articles/{i}/how-to-build-a-fast-url-shortener-with-bun-and-sqlite?utm_source=newsletter&ref={i} {payload}"),
+                    1794000000000i64 + i,
+                ])?;
+            }
+        }
+        db.query_row(
+            r#"select zstd_enable_transparent(?)"#,
+            params![r#"{"table": "urls", "column": "url", "compression_level": 3, "dict_chooser": "'a'"}"#],
+            |_| Ok(()),
+        )
+        .context("enable transparent")?;
+        let done: i64 = db
+            .query_row(
+                "select zstd_incremental_maintenance(null, 1)",
+                params![],
+                |r| r.get(0),
+            )
+            .context("maintenance")?;
+        assert_eq!(done, 0);
+        let uncompressed: i64 = db.query_row(
+            "select count(*) from _urls_zstd where _url_dict is null",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert_eq!(uncompressed, 0);
+        let avg: f64 = db.query_row("select avg(length(url)) from _urls_zstd", params![], |r| {
+            r.get(0)
+        })?;
+        assert!(
+            avg < 100.0,
+            "stored avg {avg} should be far below ~700B uncompressed"
+        );
+        // Reads, UPDATE and DELETE through the view still work.
+        let url: String = db.query_row(
+            "select url from urls where shortId = 'u001500'",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert!(url.contains("how-to-build-a-fast-url-shortener"));
+        db.execute(
+            "update urls set url = 'https://example.com/updated' where shortId = 'u000001'",
+            params![],
+        )?;
+        let url: String = db.query_row(
+            "select url from urls where shortId = 'u000001'",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert_eq!(url, "https://example.com/updated");
+        db.execute("delete from urls where shortId = 'u000002'", params![])?;
+        let n: i64 = db.query_row("select count(*) from urls", params![], |r| r.get(0))?;
+        assert_eq!(n, 1999);
+        Ok(())
+    }
+
+    /// Composite primary key on a WITHOUT ROWID table: the chunk UPDATE
+    /// must use a row-value `(a, b) IN (SELECT a, b ...)` with matching
+    /// column order.
+    #[test]
+    fn without_rowid_composite_pk() -> anyhow::Result<()> {
+        let db = Connection::open_in_memory()?;
+        crate::add_functions::add_functions(&db).context("adding functions")?;
+        db.execute_batch(
+            "create table events (
+                tenant text not null,
+                id integer not null,
+                data text not null,
+                primary key (tenant, id)
+            ) without rowid;",
+        )?;
+        {
+            let mut ins = db.prepare("insert into events(tenant, id, data) values (?1, ?2, ?3)")?;
+            for i in 0..1500 {
+                ins.execute(params![
+                    format!("tenant{}", i % 5),
+                    i,
+                    format!("{{\"i\": {i}, \"payload\": \"{}\"}}", "y".repeat(500)),
+                ])?;
+            }
+        }
+        db.query_row(
+            r#"select zstd_enable_transparent(?)"#,
+            params![r#"{"table": "events", "column": "data", "compression_level": 3, "dict_chooser": "'a'"}"#],
+            |_| Ok(()),
+        )
+        .context("enable transparent")?;
+        let done: i64 = db
+            .query_row(
+                "select zstd_incremental_maintenance(null, 1)",
+                params![],
+                |r| r.get(0),
+            )
+            .context("maintenance")?;
+        assert_eq!(done, 0);
+        let uncompressed: i64 = db.query_row(
+            "select count(*) from _events_zstd where _data_dict is null",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert_eq!(uncompressed, 0);
+        let data: String = db.query_row(
+            "select data from events where tenant = 'tenant0' and id = 1000",
+            params![],
+            |r| r.get(0),
+        )?;
+        assert!(data.contains("\"i\": 1000"));
+        Ok(())
     }
 
     #[test]

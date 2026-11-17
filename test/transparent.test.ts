@@ -105,6 +105,68 @@ describe("transparent compression", () => {
     }
   });
 
+  test("WITHOUT ROWID table with TEXT primary key compresses via PK-chunked maintenance", () => {
+    // Regression test: maintenance used `where rowid in (select rowid ...)`
+    // and failed with "no such column: rowid" on WITHOUT ROWID tables as
+    // soon as the group was big enough to train a dictionary.
+    const { db, file, dir } = tempDb();
+    try {
+      db.exec(
+        "pragma busy_timeout=5000; create table urls(shortId text primary key, url text not null, createTime integer not null) without rowid;",
+      );
+      const ins = db.prepare("insert into urls(shortId, url, createTime) values (?,?,?)");
+      db.exec("BEGIN");
+      for (let i = 0; i < 2000; i++) {
+        ins.run(
+          `u${String(i).padStart(6, "0")}`,
+          `https://example.com/articles/${i}/how-to-build-a-fast-url-shortener-with-bun-and-sqlite?utm_source=newsletter&ref=${i} ${"x".repeat(500)}`,
+          1794000000000 + i,
+        );
+      }
+      db.exec("COMMIT");
+      const before = Bun.file(file).size;
+      expect(before).toBeGreaterThan(1_000_000);
+
+      db.query(
+        `select zstd_enable_transparent('{"table": "urls", "column": "url", "compression_level": 3, "dict_chooser": "''a''"}')`,
+      ).get();
+      const more = db.query("select zstd_incremental_maintenance(null, 1) as more").get();
+      expect(more.more).toBe(0);
+
+      const stored = db
+        .query("select count(*) as n, sum(length(url)) as total from _urls_zstd")
+        .get();
+      expect(stored.n).toBe(2000);
+      expect(stored.total).toBeLessThan(before * 0.2);
+      const uncompressed = db
+        .query("select count(*) as n from _urls_zstd where _url_dict is null")
+        .get();
+      expect(uncompressed.n).toBe(0);
+
+      db.exec("vacuum;");
+      expect(Bun.file(file).size).toBeLessThan(before * 0.5);
+
+      const r = db.query("select url from urls where shortId = 'u001500'").get();
+      expect(r.url).toContain("how-to-build-a-fast-url-shortener");
+      db.prepare("update urls set url = ? where shortId = ?").run(
+        "https://example.com/updated",
+        "u000001",
+      );
+      expect(db.query("select url from urls where shortId = 'u000001'").get().url).toBe(
+        "https://example.com/updated",
+      );
+      db.prepare("delete from urls where shortId = ?").run("u000002");
+      expect(db.query("select count(*) as n from urls").get().n).toBe(1999);
+    } finally {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+      removeDir(dir);
+    }
+  });
+
   test("small tables stay uncompressed (upstream dict-size threshold)", () => {
     // A group needs total_bytes * 0.01 >= 5000 before a dictionary is
     // trained, so ~100 small rows are deliberately left alone.

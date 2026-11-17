@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 — 2026-11-17
+
+WITHOUT ROWID fix: `zstd_incremental_maintenance()` failed with
+`no such column: rowid` on WITHOUT ROWID tables as soon as a group was
+big enough to train a dictionary. Maintenance now chunks by primary key
+(`(pk...) IN (SELECT pk... ...)`) instead of `rowid`, re-derived from
+`pragma_table_info` on the shadow table at maintenance time. No change
+for rowid tables (same shrink, same maintenance time at 20k rows).
+Tests: 17 Rust (incl. `without_rowid_transparent` + `without_rowid_composite_pk`)
++ 22 JS (incl. a WITHOUT ROWID transparent test); clippy clean.
+
 ## 0.1.1 — 2026-11-17
 
 Release to validate npm trusted publishing (OIDC). The release
